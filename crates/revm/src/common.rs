@@ -204,12 +204,14 @@ pub trait TempoStateAccess<M = ()> {
             return Ok(false);
         }
 
-        // Ensure the currency is USD
+        // Ensure the currency is USD and token is not paused
         // load fee token account to ensure that we can load storage for it.
         self.with_read_only_storage_ctx(spec, || {
             // SAFETY: prefix already checked above
             let token = TIP20Token::from_address(fee_token)?;
-            Ok(token.currency.len()? == 3 && token.currency.read()?.as_str() == "USD")
+            let is_usd = token.currency.len()? == 3 && token.currency.read()?.as_str() == "USD";
+            let is_paused = token.paused()?;
+            Ok(is_usd && !is_paused)
         })
     }
 
@@ -410,9 +412,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_primitives::{address, uint};
     use revm::{context::TxEnv, database::EmptyDB, interpreter::instructions::utility::IntoU256};
-    use tempo_precompiles::PATH_USD_ADDRESS;
+    use tempo_precompiles::{
+        PATH_USD_ADDRESS,
+        tip20::{IRolesAuth::*, ITIP20::*, slots as tip20_slots},
+    };
 
     #[test]
     fn test_get_fee_token_fee_token_set() -> eyre::Result<()> {
@@ -593,8 +598,6 @@ mod tests {
 
     #[test]
     fn test_is_tip20_fee_inference_call() {
-        use tempo_precompiles::tip20::{IRolesAuth::*, ITIP20::*};
-
         // Allowed selectors
         assert!(is_tip20_fee_inference_call(&transferCall::SELECTOR));
         assert!(is_tip20_fee_inference_call(&transferWithMemoCall::SELECTOR));
@@ -608,5 +611,52 @@ mod tests {
         // Edge cases
         assert!(!is_tip20_fee_inference_call(&[]));
         assert!(!is_tip20_fee_inference_call(&[0x00, 0x01, 0x02]));
+    }
+
+    #[test]
+    fn test_is_valid_fee_token_rejects_paused_token() -> eyre::Result<()> {
+        // Use PATH_USD_ADDRESS as a valid TIP20 token with USD currency
+        let token_address = PATH_USD_ADDRESS;
+
+        // Set up CacheDB with currency="USD" and paused=true
+        let mut db = revm::database::CacheDB::new(EmptyDB::default());
+
+        // Set currency to "USD" (short string encoding: data left-aligned, LSB = len*2)
+        // "USD" = 0x555344, stored in high bytes with length 6 (3*2) in LSB
+        let usd_currency_value =
+            uint!(0x5553440000000000000000000000000000000000000000000000000000000006_U256);
+        db.insert_account_storage(token_address, tip20_slots::CURRENCY, usd_currency_value)?;
+
+        // Set paused=true
+        db.insert_account_storage(token_address, tip20_slots::PAUSED, U256::from(1))?;
+
+        // Token should be invalid when paused
+        let is_valid = db.is_valid_fee_token(TempoHardfork::Genesis, token_address)?;
+        assert!(!is_valid, "Paused tokens should not be valid fee tokens");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_valid_fee_token_accepts_unpaused_token() -> eyre::Result<()> {
+        // Use PATH_USD_ADDRESS as a valid TIP20 token with USD currency
+        let token_address = PATH_USD_ADDRESS;
+
+        // Set up CacheDB with currency="USD" and paused=false
+        let mut db = revm::database::CacheDB::new(EmptyDB::default());
+
+        // Set currency to "USD" (short string encoding: data left-aligned, LSB = len*2)
+        // "USD" = 0x555344, stored in high bytes with length 6 (3*2) in LSB
+        let usd_currency_value =
+            uint!(0x5553440000000000000000000000000000000000000000000000000000000006_U256);
+        db.insert_account_storage(token_address, tip20_slots::CURRENCY, usd_currency_value)?;
+
+        // paused=false is the default (zero), no need to set
+
+        // Token should be valid when not paused
+        let is_valid = db.is_valid_fee_token(TempoHardfork::Genesis, token_address)?;
+        assert!(is_valid, "Unpaused tokens should be valid fee tokens");
+
+        Ok(())
     }
 }

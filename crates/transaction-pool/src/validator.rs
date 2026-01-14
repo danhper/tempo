@@ -564,9 +564,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{Block, Transaction};
+    use alloy_consensus::{Block, Header, Transaction};
     use alloy_eips::Decodable2718;
-    use alloy_primitives::{Address, B256, U256, hex};
+    use alloy_primitives::{Address, B256, U256, address, hex, uint};
     use reth_primitives_traits::SignedTransaction;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_transaction_pool::{
@@ -574,12 +574,12 @@ mod tests {
     };
     use std::sync::Arc;
     use tempo_chainspec::spec::MODERATO;
-    use tempo_precompiles::tip403_registry::TIP403Registry;
+    use tempo_precompiles::{tip20::slots as tip20_slots, tip403_registry::TIP403Registry};
     use tempo_primitives::TempoTxEnvelope;
+    use tempo_revm::TempoStateAccess;
 
     /// Helper to create a mock sealed block with the given timestamp.
     fn create_mock_block(timestamp: u64) -> SealedBlock<reth_ethereum_primitives::Block> {
-        use alloy_consensus::Header;
         let header = Header {
             timestamp,
             ..Default::default()
@@ -1153,5 +1153,36 @@ mod tests {
                 "Should not fail with validity window errors, got: {error_msg}"
             );
         }
+    }
+
+    /// Paused tokens should be rejected as invalid fee tokens.
+    #[test]
+    fn test_paused_token_is_invalid_fee_token() {
+        let fee_token = address!("20C0000000000000000000000000000000000001");
+
+        // "USD" = 0x555344, stored in high bytes with length 6 (3*2) in LSB
+        let usd_currency_value =
+            uint!(0x5553440000000000000000000000000000000000000000000000000000000006_U256);
+
+        let provider =
+            MockEthProvider::default().with_chain_spec(Arc::unwrap_or_clone(MODERATO.clone()));
+        provider.add_account(
+            fee_token,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage([
+                (tip20_slots::CURRENCY.into(), usd_currency_value),
+                (tip20_slots::PAUSED.into(), U256::from(1)),
+            ]),
+        );
+
+        let mut state = provider.latest().unwrap();
+        let spec = provider.chain_spec().tempo_hardfork_at(0);
+
+        // Test that is_valid_fee_token returns false for paused tokens
+        let result = state.is_valid_fee_token(spec, fee_token);
+        assert!(result.is_ok());
+        assert!(
+            !result.unwrap(),
+            "Paused tokens should not be valid fee tokens"
+        );
     }
 }
